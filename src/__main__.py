@@ -37,6 +37,49 @@ class OutputItem(BaseModel):
     args: Dict[str, Any]
 
 
+def _is_valid_type(value: Any, expected_type: str) -> bool:
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    return True
+
+
+def _default_value_for_type(expected_type: str) -> Any:
+    if expected_type == "string":
+        return ""
+    if expected_type == "number":
+        return 0.0
+    if expected_type == "boolean":
+        return False
+    return None
+
+
+def _build_fallback_item(prompt: str, functions: List[FunctionDefinition]) -> OutputItem:
+    if not functions:
+        return OutputItem(prompt=prompt, fn_name="fn_unknown", args={})
+    first_fn = functions[0]
+    args: Dict[str, Any] = {}
+    for name, info in first_fn.parameters.items():
+        args[name] = _default_value_for_type(info.type)
+    return OutputItem(prompt=prompt, fn_name=first_fn.name, args=args)
+
+
+def _validate_output_item(item: OutputItem, functions: List[FunctionDefinition]) -> bool:
+    function_map = {fn.name: fn for fn in functions}
+    fn_def = function_map.get(item.fn_name)
+    if fn_def is None:
+        return False
+    if set(item.args.keys()) != set(fn_def.parameters.keys()):
+        return False
+    for arg_name, arg_info in fn_def.parameters.items():
+        if not _is_valid_type(item.args[arg_name], arg_info.type):
+            return False
+    return True
+
+
 def get_current_state(generated_text: str, target_prompt: str, function_names: List[str]) -> str:
     if not generated_text:
         return "START"
@@ -87,6 +130,8 @@ def get_vocab(model_sdk: Any) -> Dict[int, str]:
 def get_functions_definitions(path: str) -> List[FunctionDefinition]:
     with open(path, "r", encoding="utf-8") as f:
         raw_json = json.load(f)
+    if not isinstance(raw_json, list):
+        raise ValueError("Function definitions file must contain a JSON array.")
     return [FunctionDefinition(**item) for item in raw_json]
 
 
@@ -191,9 +236,11 @@ def generate_one(prompt: str, qwen: Any, functions: List[FunctionDefinition], vo
     try:
         parsed = json.loads(generated_json)
         validated = OutputItem(**parsed)
-        return validated
+        if _validate_output_item(validated, functions):
+            return validated
+        return _build_fallback_item(prompt, functions)
     except Exception:
-        return OutputItem(prompt=prompt, fn_name="", args={})
+        return _build_fallback_item(prompt, functions)
 
 
 def write_results(path: str, results: List[OutputItem]) -> None:
@@ -223,7 +270,7 @@ def main() -> None:
         try:
             results.append(generate_one(prompt, qwen, functions, vocab))
         except Exception:
-            results.append(OutputItem(prompt=prompt, fn_name="", args={}))
+            results.append(_build_fallback_item(prompt, functions))
 
     write_results(args.output, results)
 

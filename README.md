@@ -1,9 +1,15 @@
-*Este proyecto ha sido creado como parte del currículo de 42 por <login1>.*
+*This project was created as part of the 42 curriculum by <login1>.*
 
 ## Description
 
-`CallMeMaybe` is a function-calling project that maps natural-language prompts to structured JSON function calls.
-The goal is to ensure valid, schema-conformant JSON output through constrained decoding with a small language model.
+`CallMeMaybe` takes natural-language prompts and generates JSON function calls.
+The goal is not to answer the question directly, but to produce a machine-usable structure with:
+
+- `prompt`
+- `fn_name`
+- `args`
+
+The core idea is token-by-token generation with invalid-token filtering to keep JSON output stable.
 
 ## Instructions
 
@@ -14,16 +20,11 @@ The goal is to ensure valid, schema-conformant JSON output through constrained d
 
 ### Installation
 
-Installs both environments:
-
-- Root project dependencies from `pyproject.toml`.
-- SDK dependencies from `llm_sdk/pyproject.toml` into `.venv-sdk/`.
+The project keeps two dependency definitions (`pyproject.toml` at root and `llm_sdk/pyproject.toml`), and `make install` builds a single runtime venv at `.venv-sdk` that contains both sets of packages.
 
 ```bash
 make install
 ```
-
-Requires network access the first time (PyPI downloads).
 
 ### Run
 
@@ -31,12 +32,10 @@ Requires network access the first time (PyPI downloads).
 make run
 ```
 
-The Makefile sets `SDK_PYTHON` to `.venv-sdk/bin/python` so the SDK runner uses the correct interpreter.
-
-To run without Make (same behavior as `make run`):
+Equivalent direct command:
 
 ```bash
-SDK_PYTHON="$(pwd)/.venv-sdk/bin/python" uv run python -m src [--input <input_file>] [--output <output_file>]
+.venv-sdk/bin/python -m src --input data/input/function_calling_tests.json --output data/output/function_calling_results.json
 ```
 
 ### Debug
@@ -49,70 +48,67 @@ make debug
 
 ```bash
 make lint
-```
-
-Optional strict mode:
-
-```bash
 make lint-strict
 ```
 
 ## Algorithm Explanation
 
-The implementation follows a constrained token-by-token decoding strategy:
+At each iteration:
 
-1. Encode the prompt to input IDs.
-2. Query the model for logits of the next token.
-3. Mask invalid tokens (`-inf`) according to the current JSON-generation state.
-4. Select the best remaining token.
-5. Repeat until a complete JSON object is produced.
+1. compute logits for the next token,
+2. determine the current JSON state (`prompt`, `fn_name`, `args`),
+3. mask tokens that would break the expected structure,
+4. pick the best remaining token.
 
-This enforces structure and helps guarantee recoverable JSON output.
+This mechanism greatly reduces invalid outputs and enforces a consistent JSON shape.
 
 ## Design Decisions
 
-- Use `pydantic` models for input schema validation.
-- Separate data loading from generation flow.
-- Keep output schema fixed with keys: `prompt`, `fn_name`, `args`.
-- Prefer explicit error messages over silent failures.
+- `pydantic` is used to validate input/output structures.
+- File parsing (`prompts`, `functions`) is separated from generation.
+- Final output is validated against function signatures (name, required args, types).
+- If generation is invalid, a schema-compliant fallback is produced to avoid broken JSON.
 
-## Performance Analysis
+## Performance Notes
 
-Expected targets:
+Project targets:
 
-- Near-perfect function and argument selection (>95%).
-- 100% parseable JSON output.
-- Full test set processing in under 5 minutes on expected hardware.
+- always-parseable JSON output,
+- correct function/argument matching in most cases,
+- full run completed in a few minutes on a standard test dataset.
 
-## Challenges Encountered
+## Challenges
 
-- Small models are fragile with unconstrained generation.
-- Tokenization boundaries can make strict JSON formatting difficult.
-- Schema-safe argument generation requires careful token filtering.
+- Small models drift quickly without strict constraints.
+- Vocabulary/tokenizer formats vary across SDK implementations.
+- I/O errors (missing files, invalid JSON) must be handled cleanly without crashes.
 
 ## Testing Strategy
 
-- Validate JSON input parsing failure paths.
-- Test missing files and malformed files.
-- Run representative prompts for each available function.
-- Verify final JSON schema and argument types against function definitions.
+- test simple, ambiguous, and noisy prompts,
+- test input errors (missing file, invalid JSON),
+- verify every output object matches the expected schema.
 
 ## Usage Examples
 
 ```bash
-uv run python -m src
+make run
 uv run python -m src --input data/input/function_calling_tests.json --output data/output/function_calling_results.json
 ```
 
 ## Resources
 
-- [Pydantic documentation](https://docs.pydantic.dev/)
-- [NumPy documentation](https://numpy.org/doc/)
-- [Mypy documentation](https://mypy.readthedocs.io/en/stable/)
-- [Flake8 documentation](https://flake8.pycqa.org/en/latest/)
+- [Pydantic](https://docs.pydantic.dev/)
+- [NumPy](https://numpy.org/doc/)
+- [Mypy](https://mypy.readthedocs.io/en/stable/)
+- [Flake8](https://flake8.pycqa.org/en/latest/)
 
-AI usage in this project:
+## AI Usage
 
-- Assisted in requirement analysis and compliance checklisting.
-- Assisted in documentation structuring and command standardization.
-- All generated suggestions must be reviewed and understood before submission.
+AI was used to:
+
+- rephrase parts of the documentation,
+- sanity-check installation and run steps,
+- do quick compliance reviews.
+
+Every change was reviewed and adjusted manually before validation.

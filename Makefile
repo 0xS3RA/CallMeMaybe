@@ -1,22 +1,23 @@
-PYTHON := uv run python
 SDK_VENV := .venv-sdk
 SDK_PY := $(SDK_VENV)/bin/python
+PYTHON := uv run python
 
 .PHONY: install install-sdk run debug clean lint lint-strict
 
-# Project deps + separate SDK deps, each with its own pyproject.toml.
+# Installs root deps (dev/lint) + one runtime venv containing both root and SDK deps.
 install:
 	uv sync --all-extras
 	$(MAKE) install-sdk
 
 install-sdk:
+	UV_PROJECT_ENVIRONMENT=$(abspath $(SDK_VENV)) uv sync --all-extras
 	UV_PROJECT_ENVIRONMENT=$(abspath $(SDK_VENV)) uv sync --project llm_sdk
 
 run:
-	SDK_PYTHON=$(abspath $(SDK_PY)) $(PYTHON) -m src
+	$(SDK_PY) -m src
 
 debug:
-	SDK_PYTHON=$(abspath $(SDK_PY)) $(PYTHON) -m pdb -m src
+	$(SDK_PY) -m pdb -m src
 
 clean:
 	rm -rf __pycache__ .mypy_cache .pytest_cache
