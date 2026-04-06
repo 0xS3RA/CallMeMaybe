@@ -20,7 +20,10 @@ The core idea is token-by-token generation with invalid-token filtering to keep 
 
 ### Installation
 
-The project keeps two dependency definitions (`pyproject.toml` at root and `llm_sdk/pyproject.toml`), and `make install` builds a single runtime venv at `.venv-sdk` that contains both sets of packages.
+The project keeps two dependency definitions (`pyproject.toml` at root and `llm_sdk/pyproject.toml`). `make install` builds a single runtime venv at `.venv-sdk` with:
+
+- SDK dependencies from `llm_sdk/pyproject.toml`,
+- runtime project dependencies needed by `src` (`numpy`, `pydantic`).
 
 ```bash
 make install

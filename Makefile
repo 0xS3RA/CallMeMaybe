@@ -10,8 +10,9 @@ install:
 	$(MAKE) install-sdk
 
 install-sdk:
-	UV_PROJECT_ENVIRONMENT=$(abspath $(SDK_VENV)) uv sync --all-extras
+	@if [ ! -d "$(SDK_VENV)" ]; then uv venv "$(SDK_VENV)"; fi
 	UV_PROJECT_ENVIRONMENT=$(abspath $(SDK_VENV)) uv sync --project llm_sdk
+	uv pip install --python "$(SDK_PY)" "numpy>=1.26.4" "pydantic>=2.12.5"
 
 run:
 	$(SDK_PY) -m src
