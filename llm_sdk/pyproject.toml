@@ -1,0 +1,11 @@
+[project]
+name = "llm-sdk-runtime"
+version = "0.1.0"
+description = "Runtime environment for official llm_sdk package."
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate>=1.13.0",
+    "huggingface-hub>=1.0.0",
+    "torch>=2.5.0",
+    "transformers>=4.55.0",
+]

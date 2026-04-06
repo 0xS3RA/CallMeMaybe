@@ -1,11 +1,12 @@
-import sys
-import os
+import argparse
 import json
-import numpy as np
-from pydantic import BaseModel
-from typing import List, Dict
-from llm import Small_LLM_Model
+import os
 from enum import Enum
+from typing import Any, Dict, List
+
+import numpy as np
+from llm_sdk import Small_LLM_Model
+from pydantic import BaseModel
 
 
 class Status(Enum):
@@ -28,6 +29,13 @@ class FunctionDefinition(BaseModel):
     description: str
     parameters: Dict[str, ParameterInfo]
     returns: ParameterInfo
+
+
+class OutputItem(BaseModel):
+    prompt: str
+    fn_name: str
+    args: Dict[str, Any]
+
 
 def get_current_state(generated_text: str, target_prompt: str, function_names: List[str]) -> str:
     if not generated_text:
@@ -56,91 +64,168 @@ def get_current_state(generated_text: str, target_prompt: str, function_names: L
 
     return "UNKNOWN"
 
-def get_vocab(model_sdk: Small_LLM_Model) -> Dict[int, str]:
-    tokenizer_path = model_sdk.get_path_to_tokenizer_file()
-    with open(tokenizer_path, 'r', encoding='utf-8') as f:
+
+def get_vocab(model_sdk: Any) -> Dict[int, str]:
+    if hasattr(model_sdk, "get_path_to_vocabulary_json"):
+        tokenizer_path = model_sdk.get_path_to_vocabulary_json()
+    else:
+        tokenizer_path = model_sdk.get_path_to_tokenizer_file()
+    with open(tokenizer_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    raw_vocab = data['model']['vocab']
-    vocab = {v: k for k, v in raw_vocab.items()}
-    return vocab
+
+    raw_vocab: Dict[str, int]
+    if isinstance(data, dict) and "model" in data and isinstance(data["model"], dict) and "vocab" in data["model"]:
+        raw_vocab = data["model"]["vocab"]
+    elif isinstance(data, dict):
+        raw_vocab = data
+    else:
+        raise ValueError("Invalid vocabulary JSON format.")
+
+    return {int(v): str(k) for k, v in raw_vocab.items()}
+
 
 def get_functions_definitions(path: str) -> List[FunctionDefinition]:
-    with open(path, 'r') as f:
+    with open(path, "r", encoding="utf-8") as f:
         raw_json = json.load(f)
-    definitions = [FunctionDefinition(**item) for item in raw_json]
-    return definitions
+    return [FunctionDefinition(**item) for item in raw_json]
+
 
 def get_prompts(path: str) -> List[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError("Prompt file must contain a JSON array.")
+
+    prompts: List[str] = []
+    for item in data:
+        if isinstance(item, str):
+            prompts.append(item)
+        elif isinstance(item, dict) and "prompt" in item and isinstance(item["prompt"], str):
+            prompts.append(item["prompt"])
+    return prompts
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="CallMeMaybe function-calling generator")
+    parser.add_argument(
+        "--input",
+        default="data/input/function_calling_tests.json",
+        help="Path to function_calling_tests.json",
+    )
+    parser.add_argument(
+        "--output",
+        default="data/output/function_calling_results.json",
+        help="Path to output JSON file",
+    )
+    parser.add_argument(
+        "--functions",
+        default="data/input/function_definitions.json",
+        help="Path to function definitions JSON",
+    )
+    return parser.parse_args()
+
+
+def resolve_functions_path(path: str) -> str:
+    if os.path.exists(path):
+        return path
+    compat_path = "data/input/functions_definition.json"
+    if path == "data/input/function_definitions.json" and os.path.exists(compat_path):
+        return compat_path
+    raise FileNotFoundError(path)
+
+
+def generate_one(prompt: str, qwen: Any, functions: List[FunctionDefinition], vocab: Dict[int, str]) -> OutputItem:
+    function_names = [f.name for f in functions]
+    current_tokens = qwen.encode(prompt).tolist()[0]
+    generated_json = ""
+
+    for _ in range(200):
+        logits = qwen.get_logits_from_input_ids(current_tokens)
+        state = get_current_state(generated_json, prompt, function_names)
+        for token_id in range(len(logits)):
+            token_text = vocab.get(token_id, "").replace("Ġ", " ").replace("Ċ", "\n")
+            if state == "START":
+                if token_text != '{"prompt": "':
+                    logits[token_id] = -float("inf")
+            elif state == "IN_PROMPT":
+                header = '{"prompt": "'
+                content_already_written = generated_json[len(header):]
+                remaining_prompt = prompt[len(content_already_written):]
+                if not remaining_prompt.startswith(token_text):
+                    logits[token_id] = -float("inf")
+            elif state == "AFTER_PROMPT":
+                target = '", "fn_name": "'
+                if not target.startswith(token_text) and not token_text.startswith(target):
+                    logits[token_id] = -float("inf")
+            elif state == "IN_FN_NAME":
+                is_valid = False
+                for name in function_names:
+                    current_fn_part = generated_json.split('"fn_name": "')[-1]
+                    if name.startswith(current_fn_part + token_text):
+                        is_valid = True
+                        break
+                if not is_valid:
+                    logits[token_id] = -float("inf")
+            elif state == "AFTER_FN_NAME":
+                target = '", "args": {'
+                if not target.startswith(token_text) and not token_text.startswith(target):
+                    logits[token_id] = -float("inf")
+            elif state == "IN_ARGS":
+                try:
+                    chosen_fn_name = generated_json.split('"fn_name": "')[1].split('"')[0]
+                    current_fn_def = next(f for f in functions if f.name == chosen_fn_name)
+                except (IndexError, StopIteration):
+                    logits[token_id] = -float("inf")
+                    continue
+                args_part = generated_json.split('"args": {')[-1]
+                if args_part.count(":") >= len(current_fn_def.parameters):
+                    if token_text not in ["}", "}}"]:
+                        logits[token_id] = -float("inf")
+
+        next_token_id = int(np.argmax(logits))
+        current_tokens.append(next_token_id)
+        generated_json += qwen.decode([next_token_id])
+        if state == "COMPLETED":
+            break
+
     try:
-        with open(path, 'r', encoding='utf-8') as f:
-            data: List[Dict[str, str]] = json.load(f)
-            return  [item["prompt"] for item in data if "prompt" in item]
-    except FileNotFoundError:
-        print(f"Error: The file {path} doesn't exist")
-        return []
-    except json.JSONDecodeError:
-        print(f"Error: The file {path} is not a valid json file")
+        parsed = json.loads(generated_json)
+        validated = OutputItem(**parsed)
+        return validated
+    except Exception:
+        return OutputItem(prompt=prompt, fn_name="", args={})
+
+
+def write_results(path: str, results: List[OutputItem]) -> None:
+    output_dir = os.path.dirname(path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([r.model_dump() for r in results], f, ensure_ascii=False, indent=2)
+
 
 def main() -> None:
-    qwen = Small_LLM_Model()
-    prompts = get_prompts("data/input/function_calling_tests.json")
-    functions = get_functions_definitions("data/input/functions_definitions.json")
-    vocab: Dict[int, str] = get_vocab(qwen)
-    functions_names = [f.name for f in functions]
+    args = parse_args()
+    try:
+        qwen = Small_LLM_Model()
+        prompts = get_prompts(args.input)
+        functions = get_functions_definitions(resolve_functions_path(args.functions))
+        vocab = get_vocab(qwen)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Error: file not found: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Error: invalid JSON file: {exc}") from exc
+    except Exception as exc:
+        raise SystemExit(f"Error during initialization: {exc}") from exc
 
-    for i, p in enumerate(prompts):
-        current_tokens = qwen.encode(p).tolist()[0]
-        generated_json = ""
-        for _ in range(200):
-            logits = qwen.get_logits_from_input_ids(current_tokens)
-            state = get_current_state(generated_json, p, functions_names)
-            for token_id in range(len(logits)):
-                token_text = vocab.get(token_id, "").replace('Ġ', ' ').replace('Ċ', '\n')
-                if state == "START":
-                    if token_text != '{"prompt": "':
-                        logits[token_id] = -float("inf")
-                elif state == "IN_PROMPT":
-                    header = '{"prompt": "'
-                    content_already_written = generated_json[len(header):]
-                    remaining_prompt = p[len(content_already_written):]
-                    if not remaining_prompt.startswith(token_text):
-                        logits[token_id] = -float("inf")
-                elif state == "AFTER_PROMPT":
-                    target = '", "fn_name": "'
-                    if not target.startswith(token_text) and not token_text.startswith(target):
-                        logits[token_id] = -float("inf")
-                elif state == "IN_FN_NAME":
-                    is_valid = False
-                    for name in functions_names:
-                        current_fn_part = generated_json.split('"fn_name": "')[-1]
-                        if (name).startswith(current_fn_part + token_text):
-                            is_valid = True
-                            break
-                    if not is_valid:
-                        logits[token_id] = -float("inf")
-                elif state == "AFTER_FN_NAME":
-                    target = '", "args": {'
-                    if not target.startswith(token_text) and not token_text.startswith(target):
-                        logits[token_id] = -float("inf")
-                elif state == "IN_ARGS":
-                    try:
-                        chosen_fn_name = generated_json.split('"fn_name": "')[1].split('"')[0]
-                        current_fn_def = next(f for f in functions if f.name == chosen_fn_name)
-                    execpt (IndexError, StopIteration):
-                        logits[token_id] = -float("inf")
-                        continue
-                    args_part = generated_json.split('"args: {')[-1]
-                    if args_part.count(':') >= len(current_fn_def.parameters):
-                        if token_text not in ["}", "}}"]:
-                            logits[token_id] = -float("inf")
+    results: List[OutputItem] = []
+    for prompt in prompts:
+        try:
+            results.append(generate_one(prompt, qwen, functions, vocab))
+        except Exception:
+            results.append(OutputItem(prompt=prompt, fn_name="", args={}))
 
-
-            next_token_id = int(np.argmax(logits))
-            current_tokens.append(next_token_id)
-            new_piece = qwen.decode([next_token_id])
-            generated_json += new_piece
-            if state == "COMPLETED":
-                break
+    write_results(args.output, results)
 
 if __name__ == "__main__":
     main()
