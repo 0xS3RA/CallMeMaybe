@@ -1,6 +1,7 @@
 SDK_VENV := .venv-sdk
 SDK_PY := $(SDK_VENV)/bin/python
 PYTHON := uv run python
+export UV_CACHE_DIR := $(HOME)/sgroinfre/CallMeMaybe
 
 .PHONY: install install-sdk run debug clean lint lint-strict
 
