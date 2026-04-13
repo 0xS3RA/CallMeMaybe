@@ -1,28 +1,18 @@
 import argparse
 import json
 import os
-from enum import Enum
-from typing import Any, Dict, List
+import sys
+import time
+from typing import Any, Callable, Dict, List
 
 import numpy as np
 from llm_sdk import Small_LLM_Model
 from pydantic import BaseModel
 
 
-class Status(Enum):
-    START = 1
-    IN_PROMPT = 2
-    AFTER_PROMPT = 3
-    IN_FN_NAME = 4
-    AFTER_FN_NAME = 5
-    IN_ARGS = 6
-    COMPLETED = 7
-
-class PromptItem(BaseModel):
-    prompt: str
-
 class ParameterInfo(BaseModel):
     type: str
+
 
 class FunctionDefinition(BaseModel):
     name: str
@@ -37,242 +27,355 @@ class OutputItem(BaseModel):
     args: Dict[str, Any]
 
 
-def _is_valid_type(value: Any, expected_type: str) -> bool:
-    if expected_type == "string":
-        return isinstance(value, str)
-    if expected_type == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if expected_type == "boolean":
-        return isinstance(value, bool)
+_FN_KEY = '"fn_name": "'
+_MAX_STEPS = 512
+
+
+def _type_ok(val: Any, t: str) -> bool:
+    if t == "string":
+        return isinstance(val, str)
+    if t == "number":
+        return isinstance(val, (int, float)) and not isinstance(val, bool)
+    if t == "boolean":
+        return isinstance(val, bool)
     return True
 
 
-def _default_value_for_type(expected_type: str) -> Any:
-    if expected_type == "string":
-        return ""
-    if expected_type == "number":
-        return 0.0
-    if expected_type == "boolean":
-        return False
-    return None
-
-
-def _build_fallback_item(prompt: str, functions: List[FunctionDefinition]) -> OutputItem:
-    if not functions:
+def _fallback(prompt: str, fns: List[FunctionDefinition]) -> OutputItem:
+    if not fns:
         return OutputItem(prompt=prompt, fn_name="fn_unknown", args={})
-    first_fn = functions[0]
-    args: Dict[str, Any] = {}
-    for name, info in first_fn.parameters.items():
-        args[name] = _default_value_for_type(info.type)
-    return OutputItem(prompt=prompt, fn_name=first_fn.name, args=args)
+    fd = fns[0]
+    dflt = {"string": "", "number": 0.0, "boolean": False}
+    args = {k: dflt.get(p.type, None) for k, p in fd.parameters.items()}
+    return OutputItem(prompt=prompt, fn_name=fd.name, args=args)
 
 
-def _validate_output_item(item: OutputItem, functions: List[FunctionDefinition]) -> bool:
-    function_map = {fn.name: fn for fn in functions}
-    fn_def = function_map.get(item.fn_name)
-    if fn_def is None:
+def _valid(item: OutputItem, fns: List[FunctionDefinition]) -> bool:
+    m = {f.name: f for f in fns}
+    fd = m.get(item.fn_name)
+    if not fd or set(item.args) != set(fd.parameters):
         return False
-    if set(item.args.keys()) != set(fn_def.parameters.keys()):
-        return False
-    for arg_name, arg_info in fn_def.parameters.items():
-        if not _is_valid_type(item.args[arg_name], arg_info.type):
-            return False
-    return True
-
-
-def get_current_state(generated_text: str, target_prompt: str, function_names: List[str]) -> str:
-    if not generated_text:
-        return "START"
-
-    if generated_text.startswith('{"prompt": "'):
-        if not generated_text.endswith(f'"{target_prompt}", "fn_name": "'):
-            if generated_text == '{"prompt": "':
-                return "IN_PROMPT"
-            if generated_text.endswith(f'"{target_prompt}'):
-                return "AFTER_PROMPT"
-            return "IN_PROMPT"
-
-    if '"fn_name": "' in generated_text and '", "args": {' not in generated_text:
-        if generated_text.endswith('"fn_name": "'):
-            return "IN_FN_NAME"
-        for name in function_names:
-            if generated_text.endswith(f'"fn_name": "{name}'):
-                return "AFTER_FN_NAME"
-        return "IN_FN_NAME"
-
-    if '"args": {' in generated_text:
-        if generated_text.endswith('}}'):
-            return "COMPLETED"
-        return "IN_ARGS"
-
-    return "UNKNOWN"
-
-
-def get_vocab(model_sdk: Any) -> Dict[int, str]:
-    if hasattr(model_sdk, "get_path_to_vocabulary_json"):
-        tokenizer_path = model_sdk.get_path_to_vocabulary_json()
-    else:
-        tokenizer_path = model_sdk.get_path_to_tokenizer_file()
-    with open(tokenizer_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    raw_vocab: Dict[str, int]
-    if isinstance(data, dict) and "model" in data and isinstance(data["model"], dict) and "vocab" in data["model"]:
-        raw_vocab = data["model"]["vocab"]
-    elif isinstance(data, dict):
-        raw_vocab = data
-    else:
-        raise ValueError("Invalid vocabulary JSON format.")
-
-    return {int(v): str(k) for k, v in raw_vocab.items()}
-
-
-def get_functions_definitions(path: str) -> List[FunctionDefinition]:
-    with open(path, "r", encoding="utf-8") as f:
-        raw_json = json.load(f)
-    if not isinstance(raw_json, list):
-        raise ValueError("Function definitions file must contain a JSON array.")
-    return [FunctionDefinition(**item) for item in raw_json]
-
-
-def get_prompts(path: str) -> List[str]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, list):
-        raise ValueError("Prompt file must contain a JSON array.")
-
-    prompts: List[str] = []
-    for item in data:
-        if isinstance(item, str):
-            prompts.append(item)
-        elif isinstance(item, dict) and "prompt" in item and isinstance(item["prompt"], str):
-            prompts.append(item["prompt"])
-    return prompts
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="CallMeMaybe function-calling generator")
-    parser.add_argument(
-        "--input",
-        default="data/input/function_calling_tests.json",
-        help="Path to function_calling_tests.json",
+    return all(
+        _type_ok(item.args[k], fd.parameters[k].type) for k in fd.parameters
     )
-    parser.add_argument(
-        "--output",
-        default="data/output/function_calling_results.json",
-        help="Path to output JSON file",
+
+
+def _load_vocab(qwen: Any) -> Dict[str, int]:
+    with open(qwen.get_path_to_vocab_file(), encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError("vocab JSON invalide")
+    return {
+        k: v for k,
+        v in raw.items() if isinstance(k, str)
+        and isinstance(v, int)
+    }
+
+
+def _masked_logits(
+    logits: np.ndarray, vocab: Dict[str, int], keep: Callable[[str], bool]
+) -> np.ndarray:
+    out = np.full_like(logits, -np.inf, dtype=np.float64)
+    n = len(logits)
+    for piece, tid in vocab.items():
+        if 0 <= tid < n and piece and keep(piece):
+            out[tid] = logits[tid]
+    return out
+
+
+def _logits(qwen: Any, prefix: str, gen: str) -> np.ndarray:
+    ids = qwen.encode(prefix + gen).tolist()[0]
+    return np.asarray(qwen.get_logits_from_input_ids(ids), dtype=np.float64)
+
+
+def _preamble(fns: List[FunctionDefinition]) -> str:
+    lines = [
+        "Route the user to one function. Reply with one JSON object only.",
+        'Shape: {"prompt":"<user message>","fn_name":"<id>","args":{...}}',
+        "fn_name must be one of the ids below;",
+        " args must include every parameter with correct JSON types.",
+        "Functions:",
+    ]
+    for fn in fns:
+        ps = ", ".join(f"{k} ({v.type})" for k, v in fn.parameters.items())
+        lines.append(f"  - {fn.name}: {fn.description} — {ps}")
+    lines.append("Match the main action; fill args from the user text.")
+    return "\n".join(lines)
+
+
+def _stream_write(stream: bool, s: str) -> None:
+    if stream:
+        print(s, end="", flush=True)
+
+
+def generate_one(
+    prompt: str,
+    qwen: Any,
+    fns: List[FunctionDefinition],
+    vocab: Dict[str, int],
+    *,
+    verbose: bool = False,
+    label: str = "",
+    stream: bool = True,
+) -> OutputItem:
+    prefix = (
+            _preamble(fns) + "\n\nUser:\n" + prompt
+            + "\n\nValid JSON (complete the fragment):\n"
     )
-    parser.add_argument(
-        "--functions",
-        default="data/input/function_definitions.json",
-        help="Path to function definitions JSON",
-    )
-    return parser.parse_args()
+    esc = json.dumps(prompt, ensure_ascii=False)[1:-1]
+    gen = '{"prompt": "' + esc + '", "fn_name": "'
+    names_q = [f.name + '"' for f in fns]
+    by_name = {f.name: f for f in fns}
+    tag = f"[{label}] " if label else ""
 
+    _stream_write(stream, gen)
 
-def resolve_functions_path(path: str) -> str:
-    if os.path.exists(path):
-        return path
-    compat_path = "data/input/functions_definition.json"
-    if path == "data/input/function_definitions.json" and os.path.exists(compat_path):
-        return compat_path
-    raise FileNotFoundError(path)
+    for _ in range(_MAX_STEPS):
+        tail = gen.split(_FN_KEY, 1)[1] if _FN_KEY in gen else ""
+        log = _logits(qwen, prefix, gen)
 
+        def keep_fn_name(piece: str) -> bool:
+            return any(n.startswith(tail + piece) for n in names_q)
 
-def generate_one(prompt: str, qwen: Any, functions: List[FunctionDefinition], vocab: Dict[int, str]) -> OutputItem:
-    function_names = [f.name for f in functions]
-    current_tokens = qwen.encode(prompt).tolist()[0]
-    generated_json = ""
-
-    for _ in range(200):
-        logits = qwen.get_logits_from_input_ids(current_tokens)
-        state = get_current_state(generated_json, prompt, function_names)
-        for token_id in range(len(logits)):
-            token_text = vocab.get(token_id, "").replace("Ġ", " ").replace("Ċ", "\n")
-            if state == "START":
-                if token_text != '{"prompt": "':
-                    logits[token_id] = -float("inf")
-            elif state == "IN_PROMPT":
-                header = '{"prompt": "'
-                content_already_written = generated_json[len(header):]
-                remaining_prompt = prompt[len(content_already_written):]
-                if not remaining_prompt.startswith(token_text):
-                    logits[token_id] = -float("inf")
-            elif state == "AFTER_PROMPT":
-                target = '", "fn_name": "'
-                if not target.startswith(token_text) and not token_text.startswith(target):
-                    logits[token_id] = -float("inf")
-            elif state == "IN_FN_NAME":
-                is_valid = False
-                for name in function_names:
-                    current_fn_part = generated_json.split('"fn_name": "')[-1]
-                    if name.startswith(current_fn_part + token_text):
-                        is_valid = True
-                        break
-                if not is_valid:
-                    logits[token_id] = -float("inf")
-            elif state == "AFTER_FN_NAME":
-                target = '", "args": {'
-                if not target.startswith(token_text) and not token_text.startswith(target):
-                    logits[token_id] = -float("inf")
-            elif state == "IN_ARGS":
-                try:
-                    chosen_fn_name = generated_json.split('"fn_name": "')[1].split('"')[0]
-                    current_fn_def = next(f for f in functions if f.name == chosen_fn_name)
-                except (IndexError, StopIteration):
-                    logits[token_id] = -float("inf")
-                    continue
-                args_part = generated_json.split('"args": {')[-1]
-                if args_part.count(":") >= len(current_fn_def.parameters):
-                    if token_text not in ["}", "}}"]:
-                        logits[token_id] = -float("inf")
-
-        next_token_id = int(np.argmax(logits))
-        current_tokens.append(next_token_id)
-        generated_json += qwen.decode([next_token_id])
-        if state == "COMPLETED":
+        masked = _masked_logits(log, vocab, keep_fn_name)
+        if not np.any(np.isfinite(masked)):
+            if verbose:
+                print(f"{tag}masque fn_name vide", file=sys.stderr, flush=True)
+            break
+        piece = qwen.decode([int(np.argmax(masked))])
+        gen += piece
+        _stream_write(stream, piece)
+        if piece.endswith('"'):
             break
 
+    raw = gen.split(_FN_KEY, 1)[1] if _FN_KEY in gen else ""
+    if not raw.endswith('"'):
+        _stream_write(stream, "\n")
+        return _fallback(prompt, fns)
+    chosen = raw[:-1]
+    fd = by_name.get(chosen)
+    if fd is None:
+        _stream_write(stream, "\n")
+        return _fallback(prompt, fns)
+
+    bridge = ', "args": {'
+    gen += bridge
+    _stream_write(stream, bridge)
+    params = list(fd.parameters.items())
+
+    for i, (pname, pinfo) in enumerate(params):
+        keypart = f'"{pname}": '
+        gen += keypart
+        _stream_write(stream, keypart)
+        start = len(gen)
+
+        if pinfo.type == "string":
+            gen += '"'
+            _stream_write(stream, '"')
+            for _ in range(_MAX_STEPS):
+                piece = qwen.decode(
+                    [int(np.argmax(_logits(qwen, prefix, gen)))]
+                )
+                prev = len(gen)
+                gen += piece
+                if '"' in piece:
+                    gen = gen[: gen.rfind('"') + 1]
+                _stream_write(stream, gen[prev:])
+                if '"' in piece:
+                    break
+            else:
+                _stream_write(stream, "\n")
+                return _fallback(prompt, fns)
+
+        elif pinfo.type == "number":
+            allowed = set("0123456789.,-+eE")
+            for _ in range(_MAX_STEPS):
+                frag = gen[start:]
+                core = frag.strip().replace("Ġ", "").replace("▁", "").strip()
+                short = len(core) > 24
+
+                def keep_num(p: str) -> bool:
+                    if not p or "\n" in p or "\r" in p:
+                        return False
+                    if not set(p).issubset({",", "}"} if short else allowed):
+                        return False
+                    return not ("." in core and "." in p)
+
+                log = _logits(qwen, prefix, gen)
+                m = _masked_logits(log, vocab, keep_num)
+                tid = int(np.argmax(m if np.any(np.isfinite(m)) else log))
+                piece = qwen.decode([tid])
+                prev = len(gen)
+                gen += piece
+                if "," in piece or "}" in piece:
+                    gen = gen.rstrip(",} \n\t")
+                _stream_write(stream, gen[prev:])
+                if "," in piece or "}" in piece:
+                    break
+            else:
+                _stream_write(stream, "\n")
+                return _fallback(prompt, fns)
+
+        elif pinfo.type == "boolean":
+            for _ in range(_MAX_STEPS):
+                frag = gen[start:]
+                log = _logits(qwen, prefix, gen)
+
+                def keep_bool(piece: str) -> bool:
+                    return any(
+                        x.startswith(frag + piece) for x in ("true", "false")
+                    )
+
+                m = _masked_logits(log, vocab, keep_bool)
+                tid = int(np.argmax(m if np.any(np.isfinite(m)) else log))
+                piece = qwen.decode([tid])
+                gen += piece
+                _stream_write(stream, piece)
+                if gen[start:].strip() in ("true", "false"):
+                    break
+            else:
+                _stream_write(stream, "\n")
+                return _fallback(prompt, fns)
+        else:
+            _stream_write(stream, "\n")
+            return _fallback(prompt, fns)
+
+        if i < len(params) - 1:
+            sep = ", "
+            gen += sep
+            _stream_write(stream, sep)
+
+    closing = "}}"
+    gen += closing
+    _stream_write(stream, closing + "\n")
+
     try:
-        parsed = json.loads(generated_json)
-        validated = OutputItem(**parsed)
-        if _validate_output_item(validated, functions):
-            return validated
-        return _build_fallback_item(prompt, functions)
+        item = OutputItem(**json.loads(gen.strip()))
+        if _valid(item, fns):
+            return item
     except Exception:
-        return _build_fallback_item(prompt, functions)
+        if os.environ.get("CALLMEMYBE_DEBUG"):
+            print("fail:", repr(gen[-200:]), file=sys.stderr, flush=True)
+
+    return _fallback(prompt, fns)
 
 
-def write_results(path: str, results: List[OutputItem]) -> None:
-    output_dir = os.path.dirname(path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump([r.model_dump() for r in results], f, ensure_ascii=False, indent=2)
+def _load_json_list(path: str) -> Any:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError(f"{path} doit être un tableau JSON")
+    return data
 
 
 def main() -> None:
-    args = parse_args()
+    ap = argparse.ArgumentParser(description="CallMeMaybe")
+    ap.add_argument(
+        "--input", default="data/input/function_calling_tests.json"
+    )
+    ap.add_argument(
+        "--output", default="data/output/function_calling_results.json"
+    )
+    ap.add_argument(
+        "--functions", default="data/input/function_definitions.json"
+    )
+    ap.add_argument(
+        "-v", "--verbose", action="store_true"
+    )
+    ap.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Désactive l'affichage en direct du JSON sur stdout.",
+    )
+    args = ap.parse_args()
+
+    fn_path = args.functions
+    default_path = "data/input/functions_definition.json"
+    if not os.path.exists(fn_path):
+        if os.path.exists(default_path):
+            fn_path = default_path
+        else:
+            raise SystemExit(f"Error: file not found: {fn_path}")
+
     try:
+        t0 = time.perf_counter()
+        if args.verbose:
+            print("Chargement du modèle…", file=sys.stderr, flush=True)
         qwen = Small_LLM_Model()
-        prompts = get_prompts(args.input)
-        functions = get_functions_definitions(resolve_functions_path(args.functions))
-        vocab = get_vocab(qwen)
-    except FileNotFoundError as exc:
-        raise SystemExit(f"Error: file not found: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"Error: invalid JSON file: {exc}") from exc
-    except Exception as exc:
-        raise SystemExit(f"Error during initialization: {exc}") from exc
+        if args.verbose:
+            print(
+                f"Modèle prêt en {time.perf_counter() - t0:.1f}s",
+                file=sys.stderr, flush=True
+            )
 
-    results: List[OutputItem] = []
-    for prompt in prompts:
+        prompts_raw = _load_json_list(args.input)
+        prompts = [
+            x if isinstance(x, str) else x["prompt"]
+            for x in prompts_raw
+            if isinstance(x, str) or (
+                isinstance(x, dict) and isinstance(x.get("prompt"), str)
+            )
+        ]
+        functions = [FunctionDefinition(**x) for x in _load_json_list(fn_path)]
+        vocab = _load_vocab(qwen)
+        if args.verbose:
+            print(
+                f"{len(prompts)} prompts, "
+                f"{len(functions)} fonctions, "
+                f"{len(vocab)} tokens vocab",
+                file=sys.stderr,
+                flush=True,
+            )
+    except (OSError, json.JSONDecodeError, ValueError, KeyError) as e:
+        raise SystemExit(f"Error: {e}") from e
+
+    out: List[OutputItem] = []
+    n = len(prompts)
+    for i, prompt in enumerate(prompts):
+        lab = f"{i + 1}/{n}"
+        if args.verbose:
+            p = (
+                prompt[:72].replace("\n", " ")
+                + ("…" if len(prompt) > 72 else "")
+            )
+            print(f"[{lab}] {p!r}", file=sys.stderr, flush=True)
+        t1 = time.perf_counter()
         try:
-            results.append(generate_one(prompt, qwen, functions, vocab))
+            if not args.no_stream:
+                print(f"\n--- {lab} ---", flush=True)
+            out.append(
+                generate_one(
+                    prompt,
+                    qwen,
+                    functions,
+                    vocab,
+                    verbose=args.verbose,
+                    label=lab,
+                    stream=not args.no_stream,
+                )
+            )
         except Exception:
-            results.append(_build_fallback_item(prompt, functions))
+            out.append(_fallback(prompt, functions))
+        if args.verbose:
+            print(
+                f"[{lab}] {time.perf_counter() - t1:.1f}s → {out[-1].fn_name}",
+                file=sys.stderr,
+                flush=True,
+            )
 
-    write_results(args.output, results)
+    d = os.path.dirname(args.output)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(
+            [x.model_dump() for x in out],
+            f,
+            ensure_ascii=False, indent=2
+        )
+
+    if args.verbose:
+        print("Terminé.", file=sys.stderr, flush=True)
+
 
 if __name__ == "__main__":
     main()

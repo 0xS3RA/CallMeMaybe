@@ -2,13 +2,11 @@ import json
 import os
 import sys
 from typing import Any
-
-# Ensure repo root is importable when the runner is invoked by absolute path.
+from llm_sdk import Small_LLM_Model
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from llm_sdk import Small_LLM_Model
 
 _model: Small_LLM_Model | None = None
 
